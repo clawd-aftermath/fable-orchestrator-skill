@@ -27,7 +27,7 @@ Lessons from a project audit (a per-call, no-tools advisor structurally cannot c
 - **`UNVERIFIED CLAIMS RELIED ON:` trailer** — every response ends by listing what the advisor accepted on faith from the executor's self-report, making the trust boundary explicit.
 - **Frame-challenge rule** — the advisor first assesses whether a question's frame is sound ("should this gate exist?") before answering within it.
 - **Consult log** — every consult appends to `<log dir>/consults.jsonl` (task/question previews, full advice, project dir) for orchestrator review.
-- **Review-cadence notice** — past `FABLE_ADVISOR_REVIEW_CONSULTS` consults (default 15) or `FABLE_ADVISOR_REVIEW_DAYS` days (default 5) since the last consolidated review, every response is prefixed with an `[advisor-governance]` notice telling the executor to surface that a full-repo adversarial review is overdue. An orchestrator resets `<log dir>/state.json` (`{"consultsSinceReview": 0, "lastReviewISO": "<now>"}`) when it performs one.
+- **Review-cadence notice** — only *significant* consults count: `depth: "deep"` calls, or tasks/questions containing decision-class language (freeze/seal/launch/authorize/approve/promote/gate/spec/contract/go-no-go). Past `FABLE_ADVISOR_REVIEW_CONSULTS` significant consults (default 40) or `FABLE_ADVISOR_REVIEW_DAYS` days (default 7), every response is prefixed with an `[advisor-governance]` notice telling the executor to surface that a full-repo adversarial review is overdue. The user can force the notice at any time via `{"reviewRequested": true}` in `<log dir>/state.json`. An orchestrator resets the file (`{"consultsSinceReview": 0, "lastReviewISO": "<now>", "reviewRequested": false}`) when it performs a review.
 - **Standing project brief** — set `FABLE_ADVISOR_BRIEF` to a markdown file (goal, current stage, red flags); it is prepended to the system prompt on every call and re-read each time, so orchestrator edits apply without a server restart.
 
 ## Config env vars
@@ -42,8 +42,8 @@ Lessons from a project audit (a per-call, no-tools advisor structurally cannot c
 | `FABLE_ADVISOR_MAX_TOKENS` | `8192` | API backend only: advisor output cap (thinking + text) |
 | `FABLE_ADVISOR_BRIEF` | unset | Path to standing project brief prepended to the system prompt |
 | `FABLE_ADVISOR_LOG_DIR` | `~/.fable-advisor` | Consult log + review-cadence state location |
-| `FABLE_ADVISOR_REVIEW_CONSULTS` | `15` | Consults before the governance notice fires |
-| `FABLE_ADVISOR_REVIEW_DAYS` | `5` | Days since last review before the notice fires |
+| `FABLE_ADVISOR_REVIEW_CONSULTS` | `40` | Significant (decision-class) consults before the governance notice fires |
+| `FABLE_ADVISOR_REVIEW_DAYS` | `7` | Days since last review before the notice fires |
 
 ## Behavior notes
 

@@ -11,6 +11,8 @@ Three parameters that make advice materially better — use them:
 - `additional_dirs` (advisor_verify): whenever the discussion concerns a live or completed run, pass the relevant run/output root alongside `project_dir` so the advisor verifies telemetry itself instead of trusting your summary of it.
 - `depth: "deep"`: set it for go/no-go decisions, spec freezes, and negotiations — anything expensive to get wrong. Use `"quick"` for cheap sanity checks.
 
+Governance notices: only decision-class consults (deep depth, or freeze/seal/launch/approval-type questions) count toward the review-cadence threshold. If the user asks for a consolidated adversarial review (in any wording — "have Fable audit everything", "full review"), set `"reviewRequested": true` in `~/.fable-advisor/state.json` (preserve its other fields); every subsequent advisor response will then carry the request until the orchestrator completes the review and resets the file.
+
 Call advisor BEFORE substantive work — before writing, before committing to an interpretation, before building on an assumption. If the task requires orientation first (finding files, fetching a source, seeing what's there), do that, then call advisor. Orientation is not substantive work. Writing, editing, and declaring an answer are.
 
 Also call advisor:

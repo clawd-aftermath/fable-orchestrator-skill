@@ -61,13 +61,20 @@ const CONSULT_LOG_PATH = join(GOVERNANCE_DIR, "consults.jsonl");
 const GOVERNANCE_STATE_PATH = join(GOVERNANCE_DIR, "state.json");
 // Past either threshold, every response carries a standing notice that a
 // consolidated full-repo adversarial review is overdue. An orchestrator
-// session resets state.json when it performs one.
+// session resets state.json when it performs one. Only SIGNIFICANT consults
+// count toward the threshold (deep-depth calls, or tasks/questions touching
+// freeze/seal/launch/authorization-class decisions) — routine Q&A doesn't
+// accumulate review debt. The user can force the notice at any time by
+// having state.json set {"reviewRequested": true} (any agent can write it).
 const REVIEW_CONSULT_THRESHOLD = Number(
-  process.env.FABLE_ADVISOR_REVIEW_CONSULTS ?? 15,
+  process.env.FABLE_ADVISOR_REVIEW_CONSULTS ?? 40,
 );
 const REVIEW_AGE_DAYS_THRESHOLD = Number(
-  process.env.FABLE_ADVISOR_REVIEW_DAYS ?? 5,
+  process.env.FABLE_ADVISOR_REVIEW_DAYS ?? 7,
 );
+// Decision-class language that marks a consult as review-debt-accumulating.
+const SIGNIFICANT_CONSULT_PATTERN =
+  /freez[ei]|frozen|seal|launch|authoriz|approv|promot|go[\s/-]?no[\s/-]?go|preregist|spec\b|contract|gate|verdict|sign[\s-]?off/i;
 
 // Optional standing project brief (goal, current stage, known red flags)
 // prepended to the system prompt. Read at call time so orchestrator edits
@@ -122,6 +129,7 @@ function withBrief(system: string): string {
 interface GovernanceState {
   consultsSinceReview: number;
   lastReviewISO: string | null;
+  reviewRequested: boolean;
 }
 
 function readGovernanceState(): GovernanceState {
@@ -130,15 +138,17 @@ function readGovernanceState(): GovernanceState {
     return {
       consultsSinceReview: Number(raw.consultsSinceReview) || 0,
       lastReviewISO: typeof raw.lastReviewISO === "string" ? raw.lastReviewISO : null,
+      reviewRequested: raw.reviewRequested === true,
     };
   } catch {
-    return { consultsSinceReview: 0, lastReviewISO: null };
+    return { consultsSinceReview: 0, lastReviewISO: null, reviewRequested: false };
   }
 }
 
 /**
- * Increment the consult counter and return the standing notice when a
- * consolidated review is overdue. State/log I/O must never fail a consult.
+ * Record the consult, increment the counter for significant consults only,
+ * and return the standing notice when a consolidated review is overdue or
+ * user-requested. State/log I/O must never fail a consult.
  */
 function recordConsultAndGetNotice(entry: {
   tool: string;
@@ -146,12 +156,16 @@ function recordConsultAndGetNotice(entry: {
   context: string;
   question?: string;
   projectDir?: string;
+  depth?: string;
   advice: string;
 }): string | null {
   try {
     mkdirSync(GOVERNANCE_DIR, { recursive: true });
     const state = readGovernanceState();
-    state.consultsSinceReview += 1;
+    const significant =
+      entry.depth === "deep" ||
+      SIGNIFICANT_CONSULT_PATTERN.test(`${entry.task}\n${entry.question ?? ""}`);
+    if (significant) state.consultsSinceReview += 1;
     if (!state.lastReviewISO) state.lastReviewISO = new Date().toISOString();
     writeFileSync(GOVERNANCE_STATE_PATH, JSON.stringify(state, null, 2) + "\n");
 
@@ -164,12 +178,19 @@ function recordConsultAndGetNotice(entry: {
         taskPreview: entry.task.slice(0, 300),
         contextChars: entry.context.length,
         questionPreview: entry.question?.slice(0, 300) ?? null,
+        significant,
         advice: entry.advice,
         consultsSinceReview: state.consultsSinceReview,
         serverVersion: SERVER_VERSION,
       }) + "\n",
     );
 
+    if (state.reviewRequested) {
+      return (
+        "[advisor-governance] The user has requested a consolidated adversarial review. " +
+        "Surface this to the user verbatim and do not treat any new spec, seal, or launch as approved until that review completes and resets this flag."
+      );
+    }
     const ageDays =
       (Date.now() - Date.parse(state.lastReviewISO)) / 86_400_000;
     if (
@@ -177,7 +198,7 @@ function recordConsultAndGetNotice(entry: {
       ageDays >= REVIEW_AGE_DAYS_THRESHOLD
     ) {
       return (
-        `[advisor-governance] ${state.consultsSinceReview} consults since the last consolidated review` +
+        `[advisor-governance] ${state.consultsSinceReview} significant (decision-class) consults since the last consolidated review` +
         (state.lastReviewISO ? ` (last: ${state.lastReviewISO.slice(0, 10)})` : "") +
         ". A full-repo adversarial review is overdue — surface this notice to the user verbatim and recommend scheduling one before further frozen specs, seals, or launch approvals. Per-consult advice cannot catch whole-program drift."
       );
@@ -463,7 +484,7 @@ async function consultViaApi(
 
 // Bump on behavior changes: printed at startup so `ps` + codex logs can tell
 // a stale long-lived server process from one running current code.
-const SERVER_VERSION = "2.1.0";
+const SERVER_VERSION = "2.2.0";
 
 const server = new McpServer({
   name: "fable-advisor-mcp-server",
@@ -535,6 +556,7 @@ async function runConsult(
     context: params.context,
     question: params.question,
     projectDir,
+    depth: params.depth,
     advice,
   });
   return notice ? `${notice}\n\n${advice}` : advice;

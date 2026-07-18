@@ -126,9 +126,14 @@ const entries = readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON
 if (entries.length !== 2) fail(`expected 2 log entries, got ${entries.length}`);
 if (entries[1].tool !== "advisor_verify" || entries[1].projectDir !== projectDir)
   fail("second log entry malformed");
+// Consult 1 ("Ship it?") is routine; consult 2 asks about a safety GATE →
+// significant. Weighted counting must count exactly the second one.
+if (entries[0].significant !== false || entries[1].significant !== true)
+  fail(`significance flags wrong: ${entries[0].significant}, ${entries[1].significant}`);
 const state = JSON.parse(readFileSync(statePath, "utf8"));
-if (state.consultsSinceReview !== 2) fail(`state count ${state.consultsSinceReview} != 2`);
-console.log("PASS 3: consult log + governance state written correctly");
+if (state.consultsSinceReview !== 1)
+  fail(`state count ${state.consultsSinceReview} != 1 (only significant consults count)`);
+console.log("PASS 3: consult log + weighted governance counting correct");
 
 clearTimeout(watchdog);
 server.kill();
