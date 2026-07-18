@@ -1,3 +1,8 @@
+---
+name: plan-negotiation
+description: Critique, negotiate, approve, and execute Claude/Fable-authored plans as a single binding authority. Use when a user hands Codex a Claude-authored draft plan for review, negotiation, agreement, implementation, or amendment.
+---
+
 # Plan Negotiation — Claude-authored plans, adversarially agreed, then binding
 
 ## When this applies
@@ -41,13 +46,21 @@ critique first, so the advisor cannot anchor you. Check at minimum:
 - **Missing alternatives:** is there a cheaper standard-recipe experiment the
   plan skips? Name it with a cost estimate.
 
-## Phase 2 — Negotiation via the advisor
+## Phase 2 — Negotiation via fresh advisor calls
 
-Send your critique through `advisor_verify` (NOT plain `advisor`), with
-`project_dir` set to the repo/folder containing the plan, so Fable re-reads the
-plan and your cited evidence rather than trusting either side's summary.
+Send your critique through a fresh plain `advisor` call. Put the plan's durable
+state and already-resolved decisions in `project_state`; put the disputed plan
+text, direct file excerpts, command output, your critique, and proposed
+amendment in `context`. Do not resume prior advisor sessions: each round must be
+self-contained so history growth cannot hide cost or anchor the negotiation.
 
-- One disagreement thread per call where practical; include your evidence and
+If Fable identifies missing evidence, read it yourself and make another fresh
+plain call with that evidence. Use at most one scoped `advisor_verify` when a
+specific factual dispute cannot be packaged credibly or a genuinely
+costly-to-undo final sign-off needs independent repository evidence. Name the
+exact claims and file:line pointers; do not request a broad repo exploration.
+
+- One disagreement per call where practical; include your evidence and
   proposed amendment text, not just objections.
 - Iterate until every point is resolved as: **adopted** (plan amended),
   **rejected with reasons** (recorded), or **escalated to the user** (genuine
@@ -68,11 +81,11 @@ the user has seen the agreed version.
 ## Phase 4 — Implementation under the plan
 
 - The agreed plan is binding. Deviations require a plan amendment negotiated
-  the same way (a quick advisor_verify round), not silent drift. Small
+  the same way (a fresh rich plain round), not silent drift. Small
   mechanical details the plan doesn't specify are yours; anything touching
   scope, sequencing, success criteria, budgets, or stop rules is an amendment.
-- Consult the advisor at every checkpoint the plan declares (each milestone
-  boundary at minimum), passing actual results — not summaries of results.
+- Consult the plain advisor at every checkpoint the plan declares, passing
+  compact state plus the actual controlling evidence and results.
 - If reality falsifies a plan assumption, stop and renegotiate that section;
   the plan's stop rules and simplification ladder apply, never an unplanned
   patch/readiness chain.
