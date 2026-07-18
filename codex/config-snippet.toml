@@ -1,9 +1,10 @@
-# Append this block to ~/.codex/config.toml on the new device.
-# IMPORTANT: replace <PATH-TO> with wherever you put the fable-advisor-mcp folder
-# (e.g. ~/projects/fable-advisor-mcp).
+# Append to ~/.codex/config.toml and replace the placeholders.
 
 [mcp_servers.fable_advisor]
 command = "node"
-args = ["<PATH-TO>/fable-advisor-mcp/dist/index.js"]
+args = ["<ABS_PATH>/fable-advisor-mcp/dist/index.js"]
 startup_timeout_sec = 20.0
 tool_timeout_sec = 600.0
+
+[mcp_servers.fable_advisor.env]
+FABLE_ADVISOR_BRIEF = "<ABS_PATH>/ADVISOR_BRIEF.md"
