@@ -22,6 +22,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   existsSync,
@@ -46,6 +47,12 @@ const ADVISOR_EFFORT = process.env.FABLE_ADVISOR_EFFORT as
   | "xhigh"
   | "max"
   | undefined;
+// depth:"deep" effort. Default xhigh, NOT max: a max-effort advisor_verify
+// over a large repo can outlive ADVISOR_TIMEOUT_MS and return nothing —
+// the most expensive consults were the ones most likely to be lost. Set
+// FABLE_ADVISOR_DEEP_EFFORT=max to restore the old behavior deliberately.
+const ADVISOR_DEEP_EFFORT =
+  (process.env.FABLE_ADVISOR_DEEP_EFFORT as typeof ADVISOR_EFFORT) ?? "xhigh";
 // Keep under Codex's tool_timeout_sec (600) so we return a readable error
 // instead of Codex killing the call.
 const ADVISOR_TIMEOUT_MS = Number(process.env.FABLE_ADVISOR_TIMEOUT_MS ?? 570_000);
@@ -59,22 +66,25 @@ const GOVERNANCE_DIR =
   process.env.FABLE_ADVISOR_LOG_DIR ?? join(homedir(), ".fable-advisor");
 const CONSULT_LOG_PATH = join(GOVERNANCE_DIR, "consults.jsonl");
 const GOVERNANCE_STATE_PATH = join(GOVERNANCE_DIR, "state.json");
-// Past either threshold, every response carries a standing notice that a
-// consolidated full-repo adversarial review is overdue. An orchestrator
-// session resets state.json when it performs one. Only SIGNIFICANT consults
-// count toward the threshold (deep-depth calls, or tasks/questions touching
-// freeze/seal/launch/authorization-class decisions) — routine Q&A doesn't
-// accumulate review debt. The user can force the notice at any time by
-// having state.json set {"reviewRequested": true} (any agent can write it).
-const REVIEW_CONSULT_THRESHOLD = Number(
-  process.env.FABLE_ADVISOR_REVIEW_CONSULTS ?? 40,
-);
-const REVIEW_AGE_DAYS_THRESHOLD = Number(
-  process.env.FABLE_ADVISOR_REVIEW_DAYS ?? 7,
-);
+// Automatic review-cadence nagging is opt-in. With the env vars unset, the count/age
+// thresholds never fire; the only way the [advisor-governance] notice
+// appears is the user-controlled {"reviewRequested": true} in state.json
+// (any agent can write it on the user's request). Significant-consult
+// counting still runs — consultsSinceReview stays a useful signal for the
+// user deciding WHEN to trigger a review. Set FABLE_ADVISOR_REVIEW_CONSULTS
+// and/or FABLE_ADVISOR_REVIEW_DAYS to re-enable automatic nagging.
+function envThreshold(name: string): number {
+  const raw = process.env[name];
+  const value = raw ? Number(raw) : NaN;
+  return Number.isFinite(value) && value > 0 ? value : Infinity;
+}
+const REVIEW_CONSULT_THRESHOLD = envThreshold("FABLE_ADVISOR_REVIEW_CONSULTS");
+const REVIEW_AGE_DAYS_THRESHOLD = envThreshold("FABLE_ADVISOR_REVIEW_DAYS");
 // Decision-class language that marks a consult as review-debt-accumulating.
+// Deliberately excludes ordinary engineering vocabulary (spec, contract,
+// gate) that fired on routine consults and inflated the counter into noise.
 const SIGNIFICANT_CONSULT_PATTERN =
-  /freez[ei]|frozen|seal|launch|authoriz|approv|promot|go[\s/-]?no[\s/-]?go|preregist|spec\b|contract|gate|verdict|sign[\s-]?off/i;
+  /freez[ei]|frozen|seal|launch|authoriz|approv|promot|go[\s/-]?no[\s/-]?go|preregist|sign[\s-]?off/i;
 
 // Optional standing project brief (goal, current stage, known red flags)
 // prepended to the system prompt. Read at call time so orchestrator edits
@@ -82,6 +92,7 @@ const SIGNIFICANT_CONSULT_PATTERN =
 const BRIEF_PATH = process.env.FABLE_ADVISOR_BRIEF;
 
 const SHARED_RULES = `Produce a plan or course correction, not the implementation:
+- Begin your response with a single plain-text line (no bold, no heading markup) reading exactly "VERDICT: proceed", "VERDICT: revise", or "VERDICT: stop" — proceed = the executor's current plan/work is sound as-is; revise = continue, but change something specific you name; stop = a blocking problem must be resolved before any further progress. Pick the verdict for the executor's NEXT step, not for the whole project.
 - If the executor asked a specific question, answer it directly first — but if the question presupposes a frame (e.g. "how do I make this gate pass?"), first assess whether the frame itself is sound (should this gate exist? is this the right experiment?). A well-executed step inside a wrong frame is still wrong.
 - Identify the highest-leverage next steps and the failure modes the executor has not ruled out.
 - Be concrete: name files, commands, APIs, invariants, and tests where the provided context allows.
@@ -90,6 +101,8 @@ const SHARED_RULES = `Produce a plan or course correction, not the implementatio
 - End EVERY response with a section titled exactly "UNVERIFIED CLAIMS RELIED ON:" listing each load-bearing claim from the executor's context that you accepted without direct evidence (or "none"). Keep each item to one line. This section is mandatory — it marks the trust boundary for the executor and the human.`;
 
 const ADVISOR_SYSTEM = `You are the advisor: a higher-intelligence model that a faster coding agent ("the executor" — OpenAI Codex) consults mid-task for strategic guidance. The executor sends you its task, a self-reported account of its progress (files read, commands run, results, errors), and optionally a specific question. Answer directly from the provided context; do not use tools.
+
+One hard cap on your verdict: if the consult would authorize a gated milestone, promotion, launch, expensive (>~30 min), costly-to-undo, or irreversible action and the only support is the executor's own self-report, you may NOT issue "VERDICT: proceed". Cap it at "VERDICT: revise" and name the missing independent evidence or explicit user decision. Routine task/subtask completion, even final completion, is not an authorization event and may proceed from a strong evidence packet. A bare completion claim without direct excerpts (test output, diff hunks, or command results) must receive "VERDICT: revise" asking for the specific missing evidence; do not require advisor_verify solely because the task is final.
 
 ${SHARED_RULES}`;
 
@@ -104,9 +117,9 @@ ${SHARED_RULES.replace(
 
 interface AdvisorInput {
   task: string;
+  project_state?: string;
   context: string;
   question?: string;
-  thread_id?: string;
   depth?: "quick" | "deep";
 }
 
@@ -120,7 +133,7 @@ function withBrief(system: string): string {
   try {
     const brief = readFileSync(BRIEF_PATH, "utf8").trim();
     if (!brief) return system;
-    return `# Standing project brief (maintained by the user's orchestrator — trust over the executor's narrative where they conflict)\n${brief}\n\n${system}`;
+    return `# Standing project brief (operator-maintained background; not direct evidence — prefer current quoted evidence when they conflict)\n${brief}\n\n${system}`;
   } catch {
     return system; // Missing/unreadable brief must never break a consult.
   }
@@ -150,14 +163,42 @@ function readGovernanceState(): GovernanceState {
  * and return the standing notice when a consolidated review is overdue or
  * user-requested. State/log I/O must never fail a consult.
  */
+/**
+ * Parse the mandatory "VERDICT: proceed|revise|stop" opener, if present.
+ * Tolerates markdown decoration ("**VERDICT: stop**", "# VERDICT: revise")
+ * despite the prompt forbidding it — models bold it anyway.
+ */
+function extractVerdict(advice: string): string | null {
+  const match = /^[#*_>\s]*VERDICT:\s*[*_]*(proceed|revise|stop)\b/im.exec(advice);
+  return match ? match[1].toLowerCase() : null;
+}
+
+interface ConsultTelemetry {
+  backend: "claude-cli" | "api";
+  inputTokens?: number;
+  cacheCreationInputTokens?: number;
+  cacheReadInputTokens?: number;
+  outputTokens?: number;
+  numTurns?: number;
+  durationMs?: number;
+  totalCostUsd?: number;
+}
+
+interface ConsultResult {
+  advice: string;
+  telemetry: ConsultTelemetry;
+}
+
 function recordConsultAndGetNotice(entry: {
   tool: string;
   task: string;
+  projectState?: string;
   context: string;
   question?: string;
   projectDir?: string;
   depth?: string;
   advice: string;
+  telemetry: ConsultTelemetry;
 }): string | null {
   try {
     mkdirSync(GOVERNANCE_DIR, { recursive: true });
@@ -176,9 +217,15 @@ function recordConsultAndGetNotice(entry: {
         tool: entry.tool,
         projectDir: entry.projectDir ?? null,
         taskPreview: entry.task.slice(0, 300),
+        projectStateChars: entry.projectState?.length ?? 0,
+        projectStateHash: entry.projectState
+          ? createHash("sha256").update(entry.projectState).digest("hex").slice(0, 16)
+          : null,
         contextChars: entry.context.length,
         questionPreview: entry.question?.slice(0, 300) ?? null,
         significant,
+        verdict: extractVerdict(entry.advice),
+        telemetry: entry.telemetry,
         advice: entry.advice,
         consultsSinceReview: state.consultsSinceReview,
         serverVersion: SERVER_VERSION,
@@ -214,10 +261,15 @@ function buildAdvisorPrompt(params: AdvisorInput): string {
   const sections = [
     "# Task the executor is working on",
     params.task,
-    "",
-    "# Executor's self-reported progress and context",
-    params.context,
   ];
+  if (params.project_state) {
+    sections.push("", "# Compact project state", params.project_state);
+  }
+  sections.push(
+    "",
+    "# Direct evidence, progress, and current interpretation",
+    params.context,
+  );
   if (params.question) {
     sections.push("", "# Specific question for you", params.question);
   }
@@ -272,7 +324,7 @@ function runProcess(
     // which combination of 'exit'/'close'/'error'/timeout fires. Resolving
     // only on 'close' deadlocks when the child leaves behind a grandchild
     // that inherited its stdio pipes: the child exits, 'close' never fires,
-    // and (observed 2026-07-10) the advisor call hangs past its own timeout.
+    // and the advisor call hangs past its own timeout.
     const settle = (code: number | null) => {
       if (settled) return;
       settled = true;
@@ -321,17 +373,38 @@ interface CliConsultOptions {
   cwd?: string;
   /** Extra directories the advisor may read (claude --add-dir). */
   additionalDirs?: string[];
-  /** Prior advisor session to resume — preserves memory across rounds. */
-  threadId?: string;
   /** Per-call effort override ("quick" → low, "deep" → max). */
   depth?: "quick" | "deep";
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function cliConsultResult(
+  advice: string,
+  telemetry: Partial<ConsultTelemetry> = {},
+): ConsultResult {
+  return { advice, telemetry: { backend: "claude-cli", ...telemetry } };
 }
 
 async function consultViaClaudeCli(
   params: AdvisorInput,
   opts: CliConsultOptions,
-): Promise<string> {
+): Promise<ConsultResult> {
   const bin = resolveClaudeBin();
+  // Node >=18.20/20.12 (CVE-2024-27980 fix) refuses to spawn .cmd/.bat
+  // without shell:true, and shell:true cannot safely carry our multiline
+  // system-prompt args through cmd.exe quoting. Fail with instructions
+  // instead of an opaque EINVAL.
+  if (process.platform === "win32" && /\.(cmd|bat)$/i.test(bin)) {
+    return cliConsultResult(
+      `Advisor error (claude_bin_is_cmd_shim): '${bin}' is a .cmd shim, which Node cannot spawn safely. ` +
+      "Tell the user to point FABLE_ADVISOR_CLAUDE_BIN at the claude .exe instead " +
+      "(typically next to the shim, e.g. claude.exe in the same directory). " +
+      "Continue the task without advice."
+    );
+  }
   const args = [
     "-p",
     "--model",
@@ -341,20 +414,19 @@ async function consultViaClaudeCli(
     "--tools",
     opts.tools,
     "--strict-mcp-config",
-    // JSON output carries the session_id, which we surface as a thread id so
-    // multi-round negotiations can resume with full memory instead of
-    // re-reading everything from scratch each call.
+    "--no-session-persistence",
     "--output-format",
     "json",
   ];
-  if (opts.threadId) {
-    args.push("--resume", opts.threadId);
-  }
   for (const dir of opts.additionalDirs ?? []) {
     if (existsSync(dir)) args.push("--add-dir", dir);
   }
   const effort =
-    opts.depth === "quick" ? "low" : opts.depth === "deep" ? "max" : ADVISOR_EFFORT;
+    opts.depth === "quick"
+      ? "low"
+      : opts.depth === "deep"
+        ? ADVISOR_DEEP_EFFORT
+        : ADVISOR_EFFORT;
   if (effort) {
     args.push("--effort", effort);
   }
@@ -371,7 +443,7 @@ async function consultViaClaudeCli(
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     if (err.code === "ENOENT") {
-      return (
+      return cliConsultResult(
         `Advisor error (claude_cli_not_found): '${bin}' is not on this server's PATH. ` +
         "Tell the user to set FABLE_ADVISOR_CLAUDE_BIN to the claude binary path. " +
         "Continue the task without advice."
@@ -381,12 +453,12 @@ async function consultViaClaudeCli(
   }
 
   if (result.timedOut) {
-    return `Advisor error (execution_time_exceeded): the advisor call exceeded ${Math.round(ADVISOR_TIMEOUT_MS / 1000)}s and was killed. Continue the task without advice.`;
+    return cliConsultResult(`Advisor error (execution_time_exceeded): the advisor call exceeded ${Math.round(ADVISOR_TIMEOUT_MS / 1000)}s and was killed. Continue the task without advice.`);
   }
   const raw = result.stdout.trim();
   if (result.code !== 0 || !raw) {
     const detail = (result.stderr.trim() || raw || "no output").slice(0, 500);
-    return (
+    return cliConsultResult(
       `Advisor error (claude_cli_exit_${result.code ?? "unknown"}): ${detail}. ` +
       "If this mentions authentication or login, tell the user to run `claude` once " +
       "interactively to sign in. Continue the task without advice."
@@ -394,26 +466,35 @@ async function consultViaClaudeCli(
   }
   // Parse the JSON envelope; fall back to raw text if the format ever changes.
   let advice = raw;
-  let sessionId: string | undefined;
+  let telemetry: Partial<ConsultTelemetry> = {};
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (typeof parsed.result === "string" && parsed.result.trim()) {
       advice = parsed.result.trim();
-      if (typeof parsed.session_id === "string") sessionId = parsed.session_id;
       if (parsed.is_error) {
-        return `Advisor error (cli_reported_error): ${advice.slice(0, 500)}. Continue the task without advice.`;
+        return cliConsultResult(`Advisor error (cli_reported_error): ${advice.slice(0, 500)}. Continue the task without advice.`);
       }
     }
+    const usage =
+      parsed.usage && typeof parsed.usage === "object"
+        ? (parsed.usage as Record<string, unknown>)
+        : {};
+    telemetry = {
+      inputTokens: optionalNumber(usage.input_tokens),
+      cacheCreationInputTokens: optionalNumber(usage.cache_creation_input_tokens),
+      cacheReadInputTokens: optionalNumber(usage.cache_read_input_tokens),
+      outputTokens: optionalNumber(usage.output_tokens),
+      numTurns: optionalNumber(parsed.num_turns),
+      durationMs: optionalNumber(parsed.duration_ms),
+      totalCostUsd: optionalNumber(parsed.total_cost_usd),
+    };
   } catch {
     // Not JSON — use raw stdout as the advice.
   }
-  if (sessionId) {
-    advice += `\n\n[advisor thread: ${sessionId} — pass this as thread_id on a follow-up call to continue with full memory of this exchange]`;
-  }
   console.error(
-    `[fable-advisor] claude-cli ${ADVISOR_MODEL} ok (${advice.length} chars${sessionId ? `, thread ${sessionId.slice(0, 8)}` : ""})`,
+    `[fable-advisor] claude-cli ${ADVISOR_MODEL} ok (${advice.length} chars, in=${telemetry.inputTokens ?? "?"}, cache=${telemetry.cacheReadInputTokens ?? "?"}, out=${telemetry.outputTokens ?? "?"})`,
   );
-  return advice;
+  return cliConsultResult(advice, telemetry);
 }
 
 // ---------------------------------------------------------------------------
@@ -436,12 +517,19 @@ function apiErrorText(error: unknown): string {
   return `Advisor error (unavailable): ${error instanceof Error ? error.message : String(error)}. Continue the task without advice.`;
 }
 
+function apiConsultResult(
+  advice: string,
+  telemetry: Partial<ConsultTelemetry> = {},
+): ConsultResult {
+  return { advice, telemetry: { backend: "api", ...telemetry } };
+}
+
 async function consultViaApi(
   params: AdvisorInput,
   system: string,
-): Promise<string> {
+): Promise<ConsultResult> {
   if (!process.env.ANTHROPIC_API_KEY) {
-    return "Advisor error (no_api_key): FABLE_ADVISOR_BACKEND=api requires ANTHROPIC_API_KEY. Continue the task without advice.";
+    return apiConsultResult("Advisor error (no_api_key): FABLE_ADVISOR_BACKEND=api requires ANTHROPIC_API_KEY. Continue the task without advice.");
   }
   const client = new Anthropic();
   // Fable 5: thinking is always on — omit the `thinking` param entirely.
@@ -456,7 +544,7 @@ async function consultViaApi(
   const message = await stream.finalMessage();
 
   if (message.stop_reason === "refusal") {
-    return "Advisor error (refusal): the advisor declined this request for safety reasons. Continue the task without advice.";
+    return apiConsultResult("Advisor error (refusal): the advisor declined this request for safety reasons. Continue the task without advice.");
   }
 
   let advice = message.content
@@ -466,7 +554,7 @@ async function consultViaApi(
     .trim();
 
   if (!advice) {
-    return "Advisor error (empty_response): the advisor returned no text. Continue the task without advice.";
+    return apiConsultResult("Advisor error (empty_response): the advisor returned no text. Continue the task without advice.");
   }
   if (message.stop_reason === "max_tokens") {
     advice += `\n\n[Advisor output truncated at max_tokens=${ADVISOR_MAX_TOKENS}.]`;
@@ -475,7 +563,13 @@ async function consultViaApi(
   console.error(
     `[fable-advisor] api ${ADVISOR_MODEL} in=${message.usage.input_tokens} out=${message.usage.output_tokens} stop=${message.stop_reason}`,
   );
-  return advice;
+  const usage = message.usage as unknown as Record<string, unknown>;
+  return apiConsultResult(advice, {
+    inputTokens: optionalNumber(usage.input_tokens),
+    cacheCreationInputTokens: optionalNumber(usage.cache_creation_input_tokens),
+    cacheReadInputTokens: optionalNumber(usage.cache_read_input_tokens),
+    outputTokens: optionalNumber(usage.output_tokens),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -484,7 +578,7 @@ async function consultViaApi(
 
 // Bump on behavior changes: printed at startup so `ps` + codex logs can tell
 // a stale long-lived server process from one running current code.
-const SERVER_VERSION = "2.2.0";
+const SERVER_VERSION = "3.0.0";
 
 const server = new McpServer({
   name: "fable-advisor-mcp-server",
@@ -497,25 +591,25 @@ const COMMON_INPUT_SCHEMA = {
     .min(1, "task is required")
     .max(50_000)
     .describe("The user's task/request, verbatim or faithfully summarized"),
+  project_state: z
+    .string()
+    .max(12_000)
+    .optional()
+    .describe(
+      "Compact current state: goal, relevant decisions, constraints, known failures, and unresolved questions. Keep it stable and under 12,000 characters; omit when the context is self-contained.",
+    ),
   context: z
     .string()
     .min(1, "context is required — the advisor sees nothing else")
     .max(400_000)
     .describe(
-      "Self-reported progress: files read, commands run, outputs, errors, code excerpts, current plan",
+      "Direct evidence and current interpretation: exact code/diff excerpts, command outputs, evidence for and against, unverified assumptions, and the current plan. Maximum 400,000 characters; prefer a focused packet.",
     ),
   question: z
     .string()
     .max(10_000)
     .optional()
     .describe("Specific decision or question to resolve (optional)"),
-  thread_id: z
-    .string()
-    .regex(/^[0-9a-f-]{8,64}$/i, "thread_id must be an advisor-issued session id")
-    .optional()
-    .describe(
-      "Advisor thread id from a previous response's '[advisor thread: ...]' footer. Pass it on follow-up rounds of the same discussion (negotiations, multi-step reviews) so the advisor keeps full memory of the prior exchange instead of starting cold. Omit for a new topic.",
-    ),
   depth: z
     .enum(["quick", "deep"])
     .optional()
@@ -538,48 +632,48 @@ async function runConsult(
   cli: CliConsultOptions,
   projectDir?: string,
 ): Promise<string> {
-  let advice: string;
+  let result: ConsultResult;
   try {
-    advice =
+    result =
       ADVISOR_BACKEND === "api"
         ? await consultViaApi(params, withBrief(cli.system))
         : await consultViaClaudeCli(params, { ...cli, system: withBrief(cli.system) });
   } catch (error) {
-    advice =
+    const advice =
       ADVISOR_BACKEND === "api"
         ? apiErrorText(error)
         : `Advisor error (unavailable): ${error instanceof Error ? error.message : String(error)}. Continue the task without advice.`;
+    result =
+      ADVISOR_BACKEND === "api"
+        ? apiConsultResult(advice)
+        : cliConsultResult(advice);
   }
+
   const notice = recordConsultAndGetNotice({
     tool,
     task: params.task,
+    projectState: params.project_state,
     context: params.context,
     question: params.question,
     projectDir,
     depth: params.depth,
-    advice,
+    advice: result.advice,
+    telemetry: result.telemetry,
   });
-  return notice ? `${notice}\n\n${advice}` : advice;
+  return notice ? `${notice}\n\n${result.advice}` : result.advice;
 }
 
 server.registerTool(
   "advisor",
   {
     title: "Consult Fable Advisor",
-    description: `Consult a stronger reviewer model (Claude Fable 5) for strategic guidance mid-task. It sees ONLY what you pass in — nothing is auto-forwarded — so include the full picture: the task verbatim, everything relevant you have done and observed (files read, commands run, key excerpts, errors, results), and your current plan or the decision you face.
+    description: `Consult a stronger reviewer model (Claude Fable 5) for strategic guidance. This is the DEFAULT tool for strategy, review, debugging, negotiation, routine completion checks, and go/no-go framing. It has NO tools and every call is FRESH: no transcript is forwarded or resumed. Act as a context compiler—send compact project_state plus a focused context packet containing the task, exact code/diff excerpts, command outputs, evidence for and against your interpretation, unverified assumptions, and your current plan. Evidence you do not send does not exist for the advisor.
 
-Call advisor BEFORE substantive work — before writing, before committing to an interpretation, before building on an assumption. Orientation (finding files, reading, listing) is not substantive work; do that first so your context is rich, then call advisor. Also call it when you believe the task is complete (after making the deliverable durable), when stuck, or when considering a change of approach.
+Call advisor BEFORE substantive work — before writing, before committing to an interpretation, before building on an assumption. Orientation (finding files, reading, listing) is not substantive work; do that first so you have the excerpts to paste, then call advisor. Also call it when you believe the task is complete (after making the deliverable durable), when stuck, or when considering a change of approach.
 
-For decisions that rest on claims about what code/configs actually contain or do (component labels, gate semantics, "X is frozen/independent/validated"), prefer advisor_verify — it can read the repository and check instead of trusting your summary.
+Do NOT reach for advisor_verify instead of compiling a better packet. If Fable identifies missing evidence, read it yourself and make another fresh plain call with the new excerpt. advisor_verify costs an order of magnitude more and is reserved for explicit independent-audit requests, a specific load-bearing factual dispute that cannot be packaged credibly, or one genuinely costly-to-undo/irreversible authorization decision.
 
-Args:
-  - task (string): The user's task/request, verbatim or faithfully summarized.
-  - context (string): Your progress so far — files touched, commands and outputs, key code excerpts, errors, current plan. More context = better advice.
-  - question (string, optional): The specific decision or question you want resolved.
-  - thread_id (string, optional): continue a prior advisor thread with full memory (from the "[advisor thread: ...]" footer). Use for follow-up rounds on the same topic.
-  - depth (optional): 'deep' for decisions expensive to get wrong; 'quick' for cheap sanity checks.
-
-Returns: The advisor's guidance as plain text, ending with an "UNVERIFIED CLAIMS RELIED ON:" section marking what it took on faith — relay that section to the user when the decision is significant — and an "[advisor thread: ...]" footer for follow-ups. May begin with an [advisor-governance] notice; surface that to the user verbatim. If the advisor is unavailable, returns a line starting with "Advisor error" — continue the task without advice in that case.`,
+Returns guidance opening with "VERDICT: proceed|revise|stop" (act on it: revise/stop name the specific change or blocker) and ending with an "UNVERIFIED CLAIMS RELIED ON:" section marking what it took on faith. Routine task/subtask completion can proceed from direct excerpts and outputs; a bare claim gets revise asking for evidence, not a forced audit. Only authorization of a gated milestone, promotion, launch, expensive (>~30 min), costly-to-undo, or irreversible action may require independent evidence or explicit user judgment. May begin with an [advisor-governance] notice; surface that to the user verbatim. If unavailable, returns Advisor error and you continue.`,
     inputSchema: COMMON_INPUT_SCHEMA,
     annotations: COMMON_ANNOTATIONS,
   },
@@ -587,7 +681,6 @@ Returns: The advisor's guidance as plain text, ending with an "UNVERIFIED CLAIMS
     const text = await runConsult("advisor", params, {
       system: ADVISOR_SYSTEM,
       tools: "",
-      threadId: params.thread_id,
       depth: params.depth,
     });
     return { content: [{ type: "text", text }] };
@@ -600,16 +693,11 @@ server.registerTool(
     title: "Consult Fable Advisor (grounded, reads the repo)",
     description: `Like advisor, but the reviewer model gets read-only access (Read/Grep/Glob) to the project directory and verifies your load-bearing claims against the actual files before advising — citing file:line for what it checked.
 
-Use this instead of advisor whenever the decision rests on what code, configs, or docs actually contain or do: reviewing a frozen spec before launch, confirming a component is what its name claims (a "solver", an "independent teacher", a "validated gate"), checking that a metric or gate can actually fail, or any go/no-go recommendation. Slower than advisor (it reads files); worth it for anything that would be expensive to get wrong.
+EXPENSIVE — each call starts one fresh repo-reading Fable session on the user's Claude plan. Use it ONLY when (a) the user explicitly asks for independent verification/audit, (b) a plain advisor identifies a specific load-bearing factual claim that Codex cannot package credibly, or (c) one genuinely costly-to-undo or irreversible authorization decision needs independent evidence. Routine completion, ordinary gates/tests, and plan-negotiation rounds use fresh plain advisor calls.
 
-Args:
-  - task, context, question: same as advisor. Still pass rich context — it directs the verification.
-  - project_dir (string): Absolute path to the repository/project root the advisor should read.
-  - additional_dirs (optional): other roots the advisor may read; pass the relevant run/output root whenever the discussion concerns a live or completed run so the advisor can verify telemetry instead of taking your word for it.
-  - thread_id (optional): continue a prior advisor thread with full memory; use it for every round of a multi-round negotiation or review.
-  - depth (optional): 'deep' for go/no-go and negotiations; 'quick' for cheap checks.
+When you do use it, scope one decision: name the exact claims and file:line pointers to inspect. Pass an additional run/output root only when the decision depends on telemetry outside project_dir. Do not ask for broad exploration when a focused audit will decide the claim.
 
-Returns: Grounded guidance with file:line citations, ending with an "UNVERIFIED CLAIMS RELIED ON:" section for anything it could not check, plus an "[advisor thread: ...]" footer whose id you pass back as thread_id to continue. May begin with an [advisor-governance] notice; surface that to the user verbatim.`,
+Returns one fresh grounded review opening with "VERDICT: proceed|revise|stop", with file:line citations for what it verified and an "UNVERIFIED CLAIMS RELIED ON:" section for anything it could not check. May begin with an [advisor-governance] notice; surface that to the user verbatim.`,
     inputSchema: {
       ...COMMON_INPUT_SCHEMA,
       project_dir: z
@@ -622,7 +710,7 @@ Returns: Grounded guidance with file:line citations, ending with an "UNVERIFIED 
         .max(8)
         .optional()
         .describe(
-          "Other absolute directories the advisor may read (for example, a run-output directory). Nonexistent paths are skipped.",
+          "Other absolute run/output roots the advisor may read when the scoped decision depends on external telemetry. Nonexistent paths are skipped.",
         ),
     },
     annotations: COMMON_ANNOTATIONS,
@@ -656,7 +744,6 @@ Returns: Grounded guidance with file:line citations, ending with an "UNVERIFIED 
         tools: VERIFY_TOOLS,
         cwd: params.project_dir,
         additionalDirs: params.additional_dirs,
-        threadId: params.thread_id,
         depth: params.depth,
       },
       params.project_dir,
