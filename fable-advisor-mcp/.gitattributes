@@ -1,0 +1,9 @@
+# Force LF everywhere so checkouts are byte-identical across machines
+# (lesson from the poker repo's CRLF-corrupted staging clones, 2026-07-17).
+* text=auto eol=lf
+*.sh text eol=lf
+*.ts text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.toml text eol=lf

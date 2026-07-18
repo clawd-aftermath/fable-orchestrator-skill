@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adversarial Engineering"
+  short_description: "Falsify assumptions before expensive execution"
+  default_prompt: "Use $adversarial-engineering to challenge this plan and design the smallest decisive test."
