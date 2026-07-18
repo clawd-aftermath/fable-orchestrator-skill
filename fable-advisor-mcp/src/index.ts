@@ -99,6 +99,8 @@ interface AdvisorInput {
   task: string;
   context: string;
   question?: string;
+  thread_id?: string;
+  depth?: "quick" | "deep";
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +298,12 @@ interface CliConsultOptions {
   system: string;
   tools: string;
   cwd?: string;
+  /** Extra directories the advisor may read (claude --add-dir). */
+  additionalDirs?: string[];
+  /** Prior advisor session to resume — preserves memory across rounds. */
+  threadId?: string;
+  /** Per-call effort override ("quick" → low, "deep" → max). */
+  depth?: "quick" | "deep";
 }
 
 async function consultViaClaudeCli(
@@ -312,11 +320,22 @@ async function consultViaClaudeCli(
     "--tools",
     opts.tools,
     "--strict-mcp-config",
+    // JSON output carries the session_id, which we surface as a thread id so
+    // multi-round negotiations can resume with full memory instead of
+    // re-reading everything from scratch each call.
     "--output-format",
-    "text",
+    "json",
   ];
-  if (ADVISOR_EFFORT) {
-    args.push("--effort", ADVISOR_EFFORT);
+  if (opts.threadId) {
+    args.push("--resume", opts.threadId);
+  }
+  for (const dir of opts.additionalDirs ?? []) {
+    if (existsSync(dir)) args.push("--add-dir", dir);
+  }
+  const effort =
+    opts.depth === "quick" ? "low" : opts.depth === "deep" ? "max" : ADVISOR_EFFORT;
+  if (effort) {
+    args.push("--effort", effort);
   }
 
   let result: ProcessResult;
@@ -343,16 +362,36 @@ async function consultViaClaudeCli(
   if (result.timedOut) {
     return `Advisor error (execution_time_exceeded): the advisor call exceeded ${Math.round(ADVISOR_TIMEOUT_MS / 1000)}s and was killed. Continue the task without advice.`;
   }
-  const advice = result.stdout.trim();
-  if (result.code !== 0 || !advice) {
-    const detail = (result.stderr.trim() || advice || "no output").slice(0, 500);
+  const raw = result.stdout.trim();
+  if (result.code !== 0 || !raw) {
+    const detail = (result.stderr.trim() || raw || "no output").slice(0, 500);
     return (
       `Advisor error (claude_cli_exit_${result.code ?? "unknown"}): ${detail}. ` +
       "If this mentions authentication or login, tell the user to run `claude` once " +
       "interactively to sign in. Continue the task without advice."
     );
   }
-  console.error(`[fable-advisor] claude-cli ${ADVISOR_MODEL} ok (${advice.length} chars)`);
+  // Parse the JSON envelope; fall back to raw text if the format ever changes.
+  let advice = raw;
+  let sessionId: string | undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.result === "string" && parsed.result.trim()) {
+      advice = parsed.result.trim();
+      if (typeof parsed.session_id === "string") sessionId = parsed.session_id;
+      if (parsed.is_error) {
+        return `Advisor error (cli_reported_error): ${advice.slice(0, 500)}. Continue the task without advice.`;
+      }
+    }
+  } catch {
+    // Not JSON — use raw stdout as the advice.
+  }
+  if (sessionId) {
+    advice += `\n\n[advisor thread: ${sessionId} — pass this as thread_id on a follow-up call to continue with full memory of this exchange]`;
+  }
+  console.error(
+    `[fable-advisor] claude-cli ${ADVISOR_MODEL} ok (${advice.length} chars${sessionId ? `, thread ${sessionId.slice(0, 8)}` : ""})`,
+  );
   return advice;
 }
 
@@ -424,7 +463,7 @@ async function consultViaApi(
 
 // Bump on behavior changes: printed at startup so `ps` + codex logs can tell
 // a stale long-lived server process from one running current code.
-const SERVER_VERSION = "2.0.0";
+const SERVER_VERSION = "2.1.0";
 
 const server = new McpServer({
   name: "fable-advisor-mcp-server",
@@ -449,6 +488,19 @@ const COMMON_INPUT_SCHEMA = {
     .max(10_000)
     .optional()
     .describe("Specific decision or question to resolve (optional)"),
+  thread_id: z
+    .string()
+    .regex(/^[0-9a-f-]{8,64}$/i, "thread_id must be an advisor-issued session id")
+    .optional()
+    .describe(
+      "Advisor thread id from a previous response's '[advisor thread: ...]' footer. Pass it on follow-up rounds of the same discussion (negotiations, multi-step reviews) so the advisor keeps full memory of the prior exchange instead of starting cold. Omit for a new topic.",
+    ),
+  depth: z
+    .enum(["quick", "deep"])
+    .optional()
+    .describe(
+      "Optional effort override: 'quick' for cheap sanity checks, 'deep' for go/no-go reviews, negotiations, and anything expensive to get wrong. Omit for the default.",
+    ),
 };
 
 const COMMON_ANNOTATIONS = {
@@ -502,8 +554,10 @@ Args:
   - task (string): The user's task/request, verbatim or faithfully summarized.
   - context (string): Your progress so far — files touched, commands and outputs, key code excerpts, errors, current plan. More context = better advice.
   - question (string, optional): The specific decision or question you want resolved.
+  - thread_id (string, optional): continue a prior advisor thread with full memory (from the "[advisor thread: ...]" footer). Use for follow-up rounds on the same topic.
+  - depth (optional): 'deep' for decisions expensive to get wrong; 'quick' for cheap sanity checks.
 
-Returns: The advisor's guidance as plain text, ending with an "UNVERIFIED CLAIMS RELIED ON:" section marking what it took on faith — relay that section to the user when the decision is significant. May begin with an [advisor-governance] notice; surface that to the user verbatim. If the advisor is unavailable, returns a line starting with "Advisor error" — continue the task without advice in that case.`,
+Returns: The advisor's guidance as plain text, ending with an "UNVERIFIED CLAIMS RELIED ON:" section marking what it took on faith — relay that section to the user when the decision is significant — and an "[advisor thread: ...]" footer for follow-ups. May begin with an [advisor-governance] notice; surface that to the user verbatim. If the advisor is unavailable, returns a line starting with "Advisor error" — continue the task without advice in that case.`,
     inputSchema: COMMON_INPUT_SCHEMA,
     annotations: COMMON_ANNOTATIONS,
   },
@@ -511,6 +565,8 @@ Returns: The advisor's guidance as plain text, ending with an "UNVERIFIED CLAIMS
     const text = await runConsult("advisor", params, {
       system: ADVISOR_SYSTEM,
       tools: "",
+      threadId: params.thread_id,
+      depth: params.depth,
     });
     return { content: [{ type: "text", text }] };
   },
@@ -527,8 +583,11 @@ Use this instead of advisor whenever the decision rests on what code, configs, o
 Args:
   - task, context, question: same as advisor. Still pass rich context — it directs the verification.
   - project_dir (string): Absolute path to the repository/project root the advisor should read.
+  - additional_dirs (optional): other roots the advisor may read; pass the relevant run/output root whenever the discussion concerns a live or completed run so the advisor can verify telemetry instead of taking your word for it.
+  - thread_id (optional): continue a prior advisor thread with full memory; use it for every round of a multi-round negotiation or review.
+  - depth (optional): 'deep' for go/no-go and negotiations; 'quick' for cheap checks.
 
-Returns: Grounded guidance with file:line citations, ending with an "UNVERIFIED CLAIMS RELIED ON:" section for anything it could not check. May begin with an [advisor-governance] notice; surface that to the user verbatim.`,
+Returns: Grounded guidance with file:line citations, ending with an "UNVERIFIED CLAIMS RELIED ON:" section for anything it could not check, plus an "[advisor thread: ...]" footer whose id you pass back as thread_id to continue. May begin with an [advisor-governance] notice; surface that to the user verbatim.`,
     inputSchema: {
       ...COMMON_INPUT_SCHEMA,
       project_dir: z
@@ -536,10 +595,17 @@ Returns: Grounded guidance with file:line citations, ending with an "UNVERIFIED 
         .min(1)
         .max(1_000)
         .describe("Absolute path to the project root the advisor may read"),
+      additional_dirs: z
+        .array(z.string().min(1).max(1_000))
+        .max(8)
+        .optional()
+        .describe(
+          "Other absolute directories the advisor may read (for example, a run-output directory). Nonexistent paths are skipped.",
+        ),
     },
     annotations: COMMON_ANNOTATIONS,
   },
-  async (params: AdvisorInput & { project_dir: string }) => {
+  async (params: AdvisorInput & { project_dir: string; additional_dirs?: string[] }) => {
     if (!existsSync(params.project_dir)) {
       return {
         content: [
@@ -563,7 +629,14 @@ Returns: Grounded guidance with file:line citations, ending with an "UNVERIFIED 
     const text = await runConsult(
       "advisor_verify",
       params,
-      { system: ADVISOR_VERIFY_SYSTEM, tools: VERIFY_TOOLS, cwd: params.project_dir },
+      {
+        system: ADVISOR_VERIFY_SYSTEM,
+        tools: VERIFY_TOOLS,
+        cwd: params.project_dir,
+        additionalDirs: params.additional_dirs,
+        threadId: params.thread_id,
+        depth: params.depth,
+      },
       params.project_dir,
     );
     return { content: [{ type: "text", text }] };

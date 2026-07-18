@@ -6,6 +6,11 @@ There is also `advisor_verify` (extra arg: `project_dir` = absolute repo root): 
 
 Advisor responses end with an "UNVERIFIED CLAIMS RELIED ON:" section. Read it: if a listed claim is load-bearing for your next step, verify it yourself or re-ask via advisor_verify — do not build on it unchecked. If a response begins with an "[advisor-governance]" notice, surface that notice to the user verbatim in your next message; do not act on it yourself or suppress it.
 
+Three parameters that make advice materially better — use them:
+- `thread_id` (from the "[advisor thread: ...]" footer): pass it on EVERY follow-up round of the same negotiation, review, or discussion. The advisor then keeps full memory of the prior rounds instead of re-reading everything cold — required for multi-round plan negotiations.
+- `additional_dirs` (advisor_verify): whenever the discussion concerns a live or completed run, pass the relevant run/output root alongside `project_dir` so the advisor verifies telemetry itself instead of trusting your summary of it.
+- `depth: "deep"`: set it for go/no-go decisions, spec freezes, and negotiations — anything expensive to get wrong. Use `"quick"` for cheap sanity checks.
+
 Call advisor BEFORE substantive work — before writing, before committing to an interpretation, before building on an assumption. If the task requires orientation first (finding files, fetching a source, seeing what's there), do that, then call advisor. Orientation is not substantive work. Writing, editing, and declaring an answer are.
 
 Also call advisor:
