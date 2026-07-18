@@ -28,7 +28,7 @@ cp -R fable-advisor-mcp ~/projects/fable-advisor-mcp
 cd ~/projects/fable-advisor-mcp
 pnpm install
 pnpm build
-npm test          # deadlock regression test — must pass in <10s
+npm test          # deadlock + V3 routing/telemetry regressions
 ```
 
 ## 2. Register it with Codex
@@ -55,7 +55,7 @@ mkdir -p ~/.claude/commands
 cp claude/commands/orchestrate.md ~/.claude/commands/orchestrate.md
 ```
 
-Copy the reusable Codex skills referenced by the v2 guidance:
+Copy the reusable Codex skills referenced by the guidance:
 
 ```bash
 mkdir -p ~/.agents/skills
@@ -68,12 +68,14 @@ review-cadence state setup.
 
 ## 5. Verify
 
-- From `fable-advisor-mcp/`, run `node test/e2e-live.mjs`; expect `PASS 1/2/3`
-  and `ALL PASS` (requires a logged-in Claude CLI).
+- From `fable-advisor-mcp/`, run `pnpm test`; expect the deadlock regression
+  and all four deterministic V3 checks to pass. Optionally run
+  `node test/e2e-live.mjs` with a logged-in Claude CLI.
 - New Codex thread → confirm both `advisor` and `advisor_verify` are present.
-  A plain response should end with `UNVERIFIED CLAIMS RELIED ON:`; the grounded
-  tool should cite files beneath its `project_dir` (first call may take
-  ~30-60s).
+  A plain response should accept `project_state`, end with
+  `UNVERIFIED CLAIMS RELIED ON:`, and run without tools or resumed history.
+  The grounded tool should be reserved for a scoped audit and cite files
+  beneath its `project_dir`.
 - New Claude Code session → `/orchestrate <some small task>` should plan,
   dispatch to Codex, and review.
 
@@ -84,7 +86,8 @@ review-cadence state setup.
   the ChatGPT app if its embedded `codex app-server` hosts threads — those
   can hold stale MCP processes for days.
 - Advisor calls self-kill at 570s (config tool timeout is 600s).
-- The advisor sees ONLY what Codex passes in task/context/question — the
-  transcript is not auto-forwarded (AGENTS.md covers this).
+- Every call is fresh. The advisor sees ONLY what Codex passes in
+  task/project_state/context/question — the transcript is not auto-forwarded
+  or resumed (AGENTS.md covers this).
 - Optional API fallback: `FABLE_ADVISOR_BACKEND=api` + `ANTHROPIC_API_KEY`,
   but plan-based `claude -p` is the intended default.
