@@ -1,8 +1,9 @@
-# Fable Advisor MCP v2.0.0 — setup kit for a new machine
+# Fable Advisor MCP v3.0.0 — setup kit
 
 Everything needed to give OpenAI Codex CLI the `advisor` + `advisor_verify`
-tools backed by Claude Fable 5, with the governance features (unverified-claims
-trailer, consult log, review-cadence notice, standing project brief).
+tools backed by Claude Fable 5, with the governance features (VERDICT opener,
+unverified-claims trailer, consult log, review-cadence notice, standing
+project brief).
 
 ## Prerequisites on the target machine
 
@@ -27,13 +28,14 @@ pnpm build        # -> dist/index.js
 
 Either `codex mcp add fable_advisor -- node <ABS_PATH>/dist/index.js`, or add
 the block from `setup/config-toml-snippet.toml` to `~/.codex/config.toml`,
-fixing the three absolute paths for the new machine:
+replacing the placeholders:
 
 - `args` → path to `dist/index.js`
-- `FABLE_ADVISOR_CLAUDE_BIN` → path to the claude binary
-  (optional — the server also probes common user-local locations and `PATH`)
 - `FABLE_ADVISOR_BRIEF` → path to your standing project brief (optional but
   recommended; see step 5)
+
+If `claude` is not on the MCP server's `PATH`, add
+`FABLE_ADVISOR_CLAUDE_BIN` with the absolute path to the Claude executable.
 
 ## 4. Codex guidance
 
@@ -52,7 +54,8 @@ them.
 Copy `setup/ADVISOR_BRIEF.template.md` somewhere stable (e.g. the workspace root),
 fill it in for whatever project that machine works on, and point
 `FABLE_ADVISOR_BRIEF` at it. The server re-reads it on every call, so keep it
-updated as the project moves — no restart needed.
+updated as the project moves — no restart needed. It is background context,
+not direct evidence; current excerpts and outputs take precedence.
 
 ## 6. Seed governance state (recommended)
 
@@ -60,7 +63,7 @@ So the review-cadence clock starts from a known point:
 
 ```bash
 mkdir -p ~/.fable-advisor
-printf '{\n  "consultsSinceReview": 0,\n  "lastReviewISO": "%s"\n}\n' \
+printf '{\n  "consultsSinceReview": 0,\n  "lastReviewISO": "%s",\n  "reviewRequested": false\n}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > ~/.fable-advisor/state.json
 ```
 
@@ -82,8 +85,11 @@ its tool list shows both `advisor` and `advisor_verify`.
 
 - The running MCP server holds loaded code in memory: after any rebuild,
   restart Codex to activate changes.
-- Governance thresholds are tunable via `FABLE_ADVISOR_REVIEW_CONSULTS`
-  (default 15) and `FABLE_ADVISOR_REVIEW_DAYS` (default 5).
+- Automatic review-cadence nagging is OFF by default; the governance notice
+  fires only on user-set `{"reviewRequested": true}` in state.json. Opt in
+  to automatic thresholds via `FABLE_ADVISOR_REVIEW_CONSULTS` /
+  `FABLE_ADVISOR_REVIEW_DAYS`. `depth: "deep"` effort is tunable via
+  `FABLE_ADVISOR_DEEP_EFFORT` (default xhigh).
 - `advisor_verify` requires the claude-cli backend (the default). The `api`
   backend supports only the plain `advisor` tool.
 - Full docs: README.md in the repo.

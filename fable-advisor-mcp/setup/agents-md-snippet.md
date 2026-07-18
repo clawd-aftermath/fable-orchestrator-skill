@@ -1,50 +1,22 @@
 ## Fable Advisor (fable_advisor MCP → `advisor` + `advisor_verify` tools)
 
-You have access to an `advisor` tool backed by a stronger reviewer model (Claude Fable 5). It sees ONLY what you pass in the `task`, `context`, and `question` parameters — your conversation is NOT auto-forwarded. Every call must carry the full picture: the task verbatim, every relevant thing you've done and observed (files read, commands run, key excerpts, errors, results), and your current plan or the decision you face. Thin context produces generic advice; rich context produces a plan you can execute.
+A stronger reviewer model (Claude Fable 5) you consult mid-task. Every call is fresh and sees ONLY what you pass in `task`/`project_state`/`context`/`question` — your conversation is NOT auto-forwarded or resumed. The tool descriptions carry the mechanics; this section carries the rules of engagement:
 
-There is also `advisor_verify` (extra arg: `project_dir` = absolute repo root): the same reviewer with read-only access to the project, which verifies your load-bearing claims against the actual files before advising. Prefer it over `advisor` whenever the decision rests on what code/configs actually contain or do — reviewing a spec before freezing or launching, any go/no-go recommendation, or any claim of the form "X is a solver / independent / frozen / validated / can fail". It is slower; use plain `advisor` for pure strategy questions with no factual claims to check.
-
-Advisor responses end with an "UNVERIFIED CLAIMS RELIED ON:" section. Read it: if a listed claim is load-bearing for your next step, verify it yourself or re-ask via advisor_verify — do not build on it unchecked. If a response begins with an "[advisor-governance]" notice, surface that notice to the user verbatim in your next message; do not act on it yourself or suppress it.
-
-Three parameters that make advice materially better — use them:
-- `thread_id` (from the "[advisor thread: ...]" footer): pass it on EVERY follow-up round of the same negotiation, review, or discussion. The advisor then keeps full memory of the prior rounds instead of re-reading everything cold — required for multi-round plan negotiations.
-- `additional_dirs` (advisor_verify): whenever the discussion concerns a live or completed run, pass the relevant run/output root alongside `project_dir` so the advisor verifies telemetry itself instead of trusting your summary of it.
-- `depth: "deep"`: set it for go/no-go decisions, spec freezes, and negotiations — anything expensive to get wrong. Use `"quick"` for cheap sanity checks.
-
-Governance notices: only decision-class consults (deep depth, or freeze/seal/launch/approval-type questions) count toward the review-cadence threshold. If the user asks for a consolidated adversarial review (in any wording — "have Fable audit everything", "full review"), set `"reviewRequested": true` in `~/.fable-advisor/state.json` (preserve its other fields); every subsequent advisor response will then carry the request until the orchestrator completes the review and resets the file.
-
-Call advisor BEFORE substantive work — before writing, before committing to an interpretation, before building on an assumption. If the task requires orientation first (finding files, fetching a source, seeing what's there), do that, then call advisor. Orientation is not substantive work. Writing, editing, and declaring an answer are.
-
-Also call advisor:
-- When you believe the task is complete. BEFORE this call, make your deliverable durable: write the file, save the result, commit the change. The advisor call takes time; if the session ends during it, a durable result persists and an unwritten one doesn't.
-- When stuck — errors recurring, approach not converging, results that don't fit.
-- When considering a change of approach.
-
-On tasks longer than a few steps, call advisor at least once before committing to an approach and once before declaring done. On short reactive tasks where the next action is dictated by tool output you just read, you don't need to keep calling — the advisor adds most of its value on the first call, before the approach crystallizes.
-
-Give the advice serious weight. If you follow a step and it fails empirically, or you have primary-source evidence that contradicts a specific claim (the file says X, the paper states Y), adapt. A passing self-test is not evidence the advice is wrong — it's evidence your test doesn't check what the advice is checking.
-
-If you've already retrieved data pointing one way and the advisor points another: don't silently switch. Surface the conflict in one more advisor call — "I found X, you suggest Y, which constraint breaks the tie?" Include the conflicting evidence in `context`; a reconcile call is cheaper than committing to the wrong branch.
-
-If the tool returns a line starting with "Advisor error", continue the task without advice (and relay any key-setup instructions in the error to the user).
+- **Default = rich plain `advisor`.** Act as a context compiler. Put compact, durable state (goal, decisions, constraints, known failures, unresolved questions) in `project_state` and direct evidence in `context`: exact code/diff excerpts, command outputs, evidence for and against your interpretation, unverified assumptions, current plan, and the specific decision. Sparse calls should be rich calls, not thin calls.
+- **Escalation ladder.** First make a fresh plain call. If Fable identifies missing evidence, read it yourself and make another fresh plain call. Use ONE fresh `advisor_verify` only when the user explicitly requests an independent audit, a specific load-bearing factual dispute cannot be packaged credibly, or a genuinely costly-to-undo/irreversible authorization decision needs independent evidence. Routine completion, ordinary gates/tests, and plan-negotiation rounds stay plain.
+- **Authorization boundary.** When advice would authorize a gated milestone, promotion, launch, >~30-minute run, costly-to-undo action, or irreversible action and the packet lacks independent evidence, expect `revise`: supply the missing evidence, run one scoped audit, or ask the user to decide. Ordinary task/subtask completion—even final completion—is not an authorization event, but a bare completion claim must get `revise` asking for direct test/diff/command evidence rather than forcing an audit.
+- **Act on the VERDICT line.** Every response opens with `VERDICT: proceed|revise|stop`. revise/stop name a specific change or blocker — address it before continuing; do not proceed past a `stop` without resolving it or escalating to the user.
+- **UNVERIFIED CLAIMS RELIED ON.** If a listed claim is load-bearing for your next step, verify it yourself or re-ask via `advisor_verify` — never build on it unchecked.
+- **`[advisor-governance]` notices**: surface them to the user verbatim in your next message; do not act on them yourself or suppress them. If the user asks for a consolidated adversarial review (any wording), set `"reviewRequested": true` in `~/.fable-advisor/state.json`, preserving its other fields.
+- **Weighting.** Give the advice serious weight. Adapt only on empirical failure or primary-source evidence contradicting a specific claim. A passing self-test is not evidence the advice is wrong — it's evidence your test doesn't check what the advice checks.
+- **Conflicts.** If your evidence points one way and the advisor another, don't silently pick: make one reconcile call — "I found X, you suggest Y, which constraint breaks the tie?" — with the conflicting evidence in `context`.
+- **Durability first.** Before an at-completion advisor call, make the deliverable durable (write the file, commit the change) — a durable result survives the session ending mid-call; an unwritten one doesn't.
+- **Errors.** A response starting with "Advisor error" means continue without advice (relay any setup instructions in it to the user).
 
 ## Claude-Authored Plans (plan-negotiation protocol)
 
-When the user hands you a plan created by Claude/Fable ("this is the plan Claude
-created, take a look"), read and follow
-`~/.agents/skills/plan-negotiation/SKILL.md`. Summary: form your own
-written critique before any advisor call; negotiate disagreements through
-`advisor_verify` with `project_dir` pointing at the plan's repo; record every
-resolution in the plan's Negotiation log; mark the plan AGREED only when no
-open points remain and the user has approved; then treat the agreed plan as the
-single binding authority during implementation — deviations are negotiated
-amendments, not silent drift, and there are no parallel "non-authoritative"
-document trees.
+When the user hands you a plan created by Claude/Fable ("this is the plan Claude created, take a look"), read and follow ~/.agents/skills/plan-negotiation/SKILL.md. Summary: form your own written critique BEFORE any advisor call; negotiate with fresh rich plain calls; use at most one scoped `advisor_verify` for a disputed factual claim or high-impact final sign-off; record every resolution in the plan's Negotiation log; mark the plan AGREED only when no open points remain and the user has approved; then treat it as the single binding authority.
 
 ## Adversarial Engineering for Expensive Work
 
-For scientifically load-bearing ML, training, or evaluation work, irreversible migrations, or operations expected to consume more than about 30 minutes of compute or be costly to undo, read and follow `~/.agents/skills/adversarial-engineering/SKILL.md`. Routine edits and low-cost reversible tasks do not require it.
-
-When that skill applies, the Fable context must include the raw load-bearing code or expression, strongest evidence for and against the plan, every unverified assumption, and the authorization or safety boundary. Ask what would make the plan wrong, which claim remains unverified, or for the cheapest decisive falsification. Advisor output and forwarded self-analysis are never independent evidence.
-
-(Copy the bundled adversarial-engineering-skill and plan-negotiation-skill folders to `~/.agents/skills/` on the target machine.)
+For scientifically load-bearing ML/training/evaluation work, irreversible migrations, or operations costing >~30 min of compute or costly to undo, read and follow ~/.agents/skills/adversarial-engineering/SKILL.md. Routine edits and low-cost reversible tasks do not require it. When it applies, the Fable context must include the raw load-bearing code or expression, strongest evidence for and against the plan, every unverified assumption, and the authorization or safety boundary. Ask what would make the plan wrong, which claim remains unverified, or for the cheapest decisive falsification. Advisor output and forwarded self-analysis are never independent evidence.
