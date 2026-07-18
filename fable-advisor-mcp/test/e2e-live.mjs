@@ -97,7 +97,9 @@ const t1 = r1.result?.content?.[0]?.text ?? "";
 if (t1.startsWith("Advisor error")) fail(`advisor errored: ${t1.slice(0, 200)}`);
 if (!t1.includes("UNVERIFIED CLAIMS RELIED ON:"))
   fail(`advisor response missing trailer: ...${t1.slice(-200)}`);
-console.log("PASS 1: advisor returned advice with UNVERIFIED CLAIMS trailer");
+if (!/^[#*_>\s]*VERDICT:\s*[*_]*(proceed|revise|stop)\b/im.test(t1))
+  fail(`advisor response missing VERDICT opener: ${t1.slice(0, 200)}`);
+console.log("PASS 1: advisor returned advice with VERDICT opener + UNVERIFIED CLAIMS trailer");
 
 // --- 2. advisor_verify: must catch the planted vacuous gate ----------------
 const r2 = await rpc("tools/call", {

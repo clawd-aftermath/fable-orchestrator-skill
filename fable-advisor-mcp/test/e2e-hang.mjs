@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Regression test for the 2026-07-10 deadlock: a claude child that exits but
+// Regression test for a deadlock: a claude child that exits but
 // leaves a grandchild holding its inherited stdio pipes must NOT hang the
 // advisor call. Drives the real server over MCP stdio with a fake claude bin.
 //
@@ -13,10 +13,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 if (process.platform === "win32") {
-  // The fake claude is a bash script; Windows spawn cannot execute it, so the
-  // test would only ever exercise the ENOENT path. The settle logic it guards
-  // is platform-independent — run this test on a POSIX box. Windows coverage
-  // lives in test/e2e-live.mjs (real claude bin, real advisor round-trip).
+  // The fake claude fixture requires bash, so run this regression on POSIX.
   console.log("SKIP: e2e-hang is a POSIX-only regression test (bash fake-claude)");
   process.exit(0);
 }
@@ -24,6 +21,7 @@ if (process.platform === "win32") {
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const fakeDir = mkdtempSync(join(tmpdir(), "fable-advisor-test-"));
+const logDir = mkdtempSync(join(tmpdir(), "fable-advisor-test-log-"));
 const fakeClaude = join(fakeDir, "fake-claude");
 writeFileSync(
   fakeClaude,
@@ -37,7 +35,11 @@ exit 0
 chmodSync(fakeClaude, 0o755);
 
 const server = spawn("node", [join(repoRoot, "dist", "index.js")], {
-  env: { ...process.env, FABLE_ADVISOR_CLAUDE_BIN: fakeClaude },
+  env: {
+    ...process.env,
+    FABLE_ADVISOR_CLAUDE_BIN: fakeClaude,
+    FABLE_ADVISOR_LOG_DIR: logDir,
+  },
   stdio: ["pipe", "pipe", "inherit"],
 });
 
