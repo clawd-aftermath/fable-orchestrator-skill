@@ -96,6 +96,17 @@ await rpc("initialize", {
 });
 server.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
+const listed = await rpc("tools/list", {});
+const advisorTool = listed.result?.tools?.find((tool) => tool.name === "advisor");
+const advisorDescription = advisorTool?.description ?? "";
+if (!advisorDescription.includes("before committing"))
+  fail("advisor description is missing the post-implementation pre-commit gate");
+if (!advisorDescription.includes("Call advisor before implementation only when"))
+  fail("advisor description is missing the risk-triggered pre-work boundary");
+if (advisorDescription.includes("Call advisor BEFORE substantive work"))
+  fail("advisor description still contains the blanket pre-work mandate");
+console.log("PASS 0: advisor timing policy is post-write by default and risk-triggered pre-work");
+
 // 1. Routine completion stays on fresh, tool-less plain advice.
 const projectState = "S".repeat(12_000);
 const plain = await rpc("tools/call", {
